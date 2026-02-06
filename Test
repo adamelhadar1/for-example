@@ -1,0 +1,1663 @@
+-- ============================================================================
+-- ULTIMATE DUEL SYSTEM - WITH DOUBLE COINS GAMEPASS + WATER & NATURAL BUNDLES
+-- Place in ServerScriptService
+-- ✅ Gamepass ID: 1702427419 gives 2x coins forever
+-- ✅ Winners get 300 coins (150 x 2) with gamepass
+-- ✅ Losers get 100 coins (50 x 2) with gamepass
+-- ✅ Full support for Water and Natural limited bundles
+-- ============================================================================
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerStorage = game:GetService("ServerStorage")
+local DataStoreService = game:GetService("DataStoreService")
+local Workspace = game:GetService("Workspace")
+local StarterGui = game:GetService("StarterGui")
+local MarketplaceService = game:GetService("MarketplaceService")
+
+print("🔧 Duel System: Starting initialization...")
+
+-- =======================
+-- GAMEPASS CONFIGURATION
+-- =======================
+local DOUBLE_COINS_GAMEPASS_ID = 1702427419 -- 💰 Double Coins gamepass
+
+-- =======================
+-- DATASTORES
+-- =======================
+local WinsDataStore = DataStoreService:GetDataStore("PlayerWins_v2")
+local WinStreakDataStore = DataStoreService:GetDataStore("WinStreaks")
+local CoinDataStore = DataStoreService:GetDataStore("PlayerCoins")
+local InventoryDataStore = DataStoreService:GetDataStore("PlayerInventory_v2")
+
+-- Cache
+local PlayerWins = {}
+local WinStreaks = {}
+local PlayerCoins = {}
+local PlayerInventories = {}
+
+print("✅ DataStores initialized")
+
+-- =======================
+-- CREATE SIGNALS
+-- =======================
+local WinSignal = ReplicatedStorage:FindFirstChild("WinSignal")
+
+if WinSignal then
+	if not WinSignal:IsA("BindableEvent") then
+		warn("⚠️ WinSignal wrong type - recreating...")
+		WinSignal:Destroy()
+		WinSignal = nil
+	end
+end
+
+if not WinSignal then
+	WinSignal = Instance.new("BindableEvent")
+	WinSignal.Name = "WinSignal"
+	WinSignal.Parent = ReplicatedStorage
+	print("✅ WinSignal created")
+end
+
+local RoundPlayedSignal = ReplicatedStorage:FindFirstChild("RoundPlayedSignal")
+
+if not RoundPlayedSignal then
+	RoundPlayedSignal = Instance.new("BindableEvent")
+	RoundPlayedSignal.Name = "RoundPlayedSignal"
+	RoundPlayedSignal.Parent = ReplicatedStorage
+	print("✅ RoundPlayedSignal created")
+end
+
+-- =======================
+-- CREATE FOLDERS
+-- =======================
+local ScoresFolder = ReplicatedStorage:FindFirstChild("Scores")
+if not ScoresFolder then
+	ScoresFolder = Instance.new("Folder")
+	ScoresFolder.Name = "Scores"
+	ScoresFolder.Parent = ReplicatedStorage
+	print("✅ Scores folder created in ReplicatedStorage")
+end
+
+-- =======================
+-- GAMEPASS FUNCTIONS
+-- =======================
+function hasDoubleCoinsGamepass(player)
+	if not player or not player.Parent then 
+		return false 
+	end
+
+	local success, hasPass = pcall(function()
+		return MarketplaceService:UserOwnsGamePassAsync(player.UserId, DOUBLE_COINS_GAMEPASS_ID)
+	end)
+
+	if success then
+		return hasPass
+	else
+		warn("⚠️ Failed to check gamepass for " .. player.Name)
+		return false
+	end
+end
+
+function getMultipliedCoins(player, baseAmount)
+	local multiplier = 1
+
+	if hasDoubleCoinsGamepass(player) then
+		multiplier = 2
+		print("💰 " .. player.Name .. " has Double Coins gamepass! (" .. baseAmount .. " x " .. multiplier .. " = " .. (baseAmount * multiplier) .. ")")
+	end
+
+	return baseAmount * multiplier
+end
+
+-- =======================
+-- MAP OFFSET MANAGER
+-- =======================
+local MapOffsetManager = {}
+MapOffsetManager.MapUsage = {}
+
+function MapOffsetManager.getNextOffset(mapName)
+	if not MapOffsetManager.MapUsage[mapName] then
+		MapOffsetManager.MapUsage[mapName] = 0
+	end
+
+	local currentCount = MapOffsetManager.MapUsage[mapName]
+	MapOffsetManager.MapUsage[mapName] = currentCount + 1
+
+	local offset = Vector3.new(currentCount * 250, 0, 0)
+
+	print("🗺️ Map '" .. mapName .. "' - Instance #" .. (currentCount + 1) .. " at offset: " .. tostring(offset))
+
+	return offset, currentCount + 1
+end
+
+function MapOffsetManager.releaseMap(mapName)
+	if MapOffsetManager.MapUsage[mapName] then
+		MapOffsetManager.MapUsage[mapName] = math.max(0, MapOffsetManager.MapUsage[mapName] - 1)
+		print("🗺️ Map '" .. mapName .. "' - Released. Active instances: " .. MapOffsetManager.MapUsage[mapName])
+	end
+end
+
+-- =======================
+-- MATCH CLASS
+-- =======================
+local Match = {}
+Match.__index = Match
+
+function Match.new(matchId, padSet, player1, player2)
+	local self = setmetatable({}, Match)
+
+	self.MatchId = matchId
+	self.PadSet = padSet
+	self.Player1 = player1
+	self.Player2 = player2
+	self.Score1 = 0
+	self.Score2 = 0
+	self.CurrentMap = nil
+	self.MapInstanceNumber = nil
+	self.IsActive = true
+	self.VotingActive = false
+	self.CoinsAwarded = false
+	self.WinPointAwarded = false
+	self.RoundActive = false
+	self.MapInstance = nil
+	self.TPConnection = nil
+	self.RoomPart = nil
+	self.Spawn1 = nil
+	self.Spawn2 = nil
+	self.TPPart = nil
+	self.PlayerConnections = {}
+	self.PlayerVotes = {}
+	self.RSParts = {}
+	self.P1ScoreValue = nil
+	self.P2ScoreValue = nil
+
+	print("🎮 Match " .. matchId .. " created: " .. player1.Name .. " vs " .. player2.Name)
+
+	self:createMatchScores()
+
+	return self
+end
+
+function Match:createMatchScores()
+	print("==========================================================")
+	print("🔧 Match " .. self.MatchId .. " - Creating IntValues")
+	print("==========================================================")
+
+	self.P1ScoreValue = Instance.new("IntValue")
+	self.P1ScoreValue.Name = "Match" .. self.MatchId .. "_P1Score"
+	self.P1ScoreValue.Value = 0
+	self.P1ScoreValue.Parent = ScoresFolder
+
+	self.P2ScoreValue = Instance.new("IntValue")
+	self.P2ScoreValue.Name = "Match" .. self.MatchId .. "_P2Score"
+	self.P2ScoreValue.Value = 0
+	self.P2ScoreValue.Parent = ScoresFolder
+
+	print("✅ Created IntValues:")
+	print("   " .. self.P1ScoreValue.Name)
+	print("   " .. self.P2ScoreValue.Name)
+	print("==========================================================")
+end
+
+function Match:setRSBarriers(enabled)
+	if #self.RSParts == 0 then
+		warn("⚠️ No RS parts found for Match " .. self.MatchId)
+		return
+	end
+
+	for _, part in ipairs(self.RSParts) do
+		if part and part.Parent then
+			part.CanCollide = enabled
+			part.Transparency = 1
+		end
+	end
+
+	local status = enabled and "ENABLED (Anti-Exploit)" or "DISABLED (Round Active)"
+	print("🛡️ Match " .. self.MatchId .. " - RS Barriers " .. status)
+end
+
+function Match:giveGuiToPlayer(player)
+	if not player or not player.Parent then return end
+
+	local playerGui = player:WaitForChild("PlayerGui", 5)
+	if not playerGui then
+		warn("❌ PlayerGui not found for " .. player.Name)
+		return
+	end
+
+	local existingGui = playerGui:FindFirstChild("BattleGui_Match" .. self.MatchId)
+	if existingGui then
+		print("⚠️ " .. player.Name .. " already has GUI for Match " .. self.MatchId)
+		return
+	end
+
+	local originalGui = StarterGui:FindFirstChild("BattleGui")
+	if not originalGui then
+		warn("❌ BattleGui not found in StarterGui!")
+		return
+	end
+
+	local guiClone = originalGui:Clone()
+	guiClone.Name = "BattleGui_Match" .. self.MatchId
+	guiClone.Enabled = true
+	guiClone.ResetOnSpawn = false
+
+	local matchIdValue = Instance.new("IntValue")
+	matchIdValue.Name = "MatchId"
+	matchIdValue.Value = self.MatchId
+	matchIdValue.Parent = guiClone
+
+	guiClone.Parent = playerGui
+
+	print("✅ Gave BattleGui_Match" .. self.MatchId .. " to " .. player.Name)
+end
+
+function Match:updateBattleGui()
+	if self.P1ScoreValue then
+		self.P1ScoreValue.Value = self.Score1
+	end
+	if self.P2ScoreValue then
+		self.P2ScoreValue.Value = self.Score2
+	end
+
+	print("📊 Match " .. self.MatchId .. " - Updated scores: " .. self.Score1 .. "-" .. self.Score2)
+end
+
+function Match:hideBattleGui()
+	print("🧹 Match " .. self.MatchId .. " - Hiding GUIs")
+
+	for _, player in ipairs({self.Player1, self.Player2}) do
+		if player and player.Parent then
+			local playerGui = player:FindFirstChild("PlayerGui")
+			if playerGui then
+				local guiName = "BattleGui_Match" .. self.MatchId
+				local gui = playerGui:FindFirstChild(guiName)
+				if gui then
+					gui:Destroy()
+					print("✅ Destroyed GUI from " .. player.Name)
+				end
+			end
+		end
+	end
+
+	task.wait(0.5)
+end
+
+function Match:cleanup()
+	print("🧹 Match " .. self.MatchId .. " - Starting cleanup")
+
+	self:hideBattleGui()
+
+	task.wait(0.5)
+
+	if self.CurrentMap then
+		MapOffsetManager.releaseMap(self.CurrentMap)
+	end
+
+	if self.P1ScoreValue and self.P1ScoreValue.Parent then
+		self.P1ScoreValue:Destroy()
+		self.P1ScoreValue = nil
+	end
+	if self.P2ScoreValue and self.P2ScoreValue.Parent then
+		self.P2ScoreValue:Destroy()
+		self.P2ScoreValue = nil
+	end
+	print("✅ Destroyed IntValues")
+
+	if self.MapInstance then
+		self.MapInstance:Destroy()
+		self.MapInstance = nil
+	end
+
+	self.RSParts = {}
+
+	if self.TPConnection then
+		self.TPConnection:Disconnect()
+		self.TPConnection = nil
+	end
+
+	for _, conn in pairs(self.PlayerConnections) do
+		if conn then
+			conn:Disconnect()
+		end
+	end
+	self.PlayerConnections = {}
+
+	self.IsActive = false
+	print("✅ Match " .. self.MatchId .. " cleanup complete")
+end
+
+function Match:startVoting()
+	self.VotingActive = true
+	print("🗳️ Match " .. self.MatchId .. " - Starting voting...")
+
+	local spawn1, spawn2
+	if self.PadSet == "Pads12" then
+		spawn1 = Workspace:WaitForChild("Spawn 1")
+		spawn2 = Workspace:WaitForChild("Spawn 2")
+	else
+		spawn1 = Workspace:WaitForChild("Spawn 3")
+		spawn2 = Workspace:WaitForChild("Spawn 4")
+	end
+
+	teleportPlayerNoRespawn(self.Player1, spawn1)
+	teleportPlayerNoRespawn(self.Player2, spawn2)
+
+	task.wait(1)
+
+	local MapVoteEvent = ReplicatedStorage:WaitForChild("MapVoteEvent")
+	if MapVoteEvent then
+		MapVoteEvent:FireClient(self.Player1, "SHOW_GUIS")
+		MapVoteEvent:FireClient(self.Player2, "SHOW_GUIS")
+		MapVoteEvent:FireClient(self.Player1, "RESET_VOTES")
+		MapVoteEvent:FireClient(self.Player2, "RESET_VOTES")
+
+		for _, player in ipairs({self.Player1, self.Player2}) do
+			if player and player.Parent then
+				task.spawn(function()
+					local playerGui = player:WaitForChild("PlayerGui")
+					local jumpGui = playerGui:FindFirstChild("JumpBasesGUI")
+					local bridgeGui = playerGui:FindFirstChild("BridgeGUI")
+					local castleGui = playerGui:FindFirstChild("CastleGUI")
+
+					if jumpGui then jumpGui.Enabled = true end
+					if bridgeGui then bridgeGui.Enabled = true end
+					if castleGui then castleGui.Enabled = true end
+				end)
+			end
+		end
+	end
+
+	for i = 5, 1, -1 do
+		if not self.IsActive then break end
+		task.wait(1)
+	end
+
+	self.VotingActive = false
+
+	if MapVoteEvent then
+		MapVoteEvent:FireClient(self.Player1, "HIDE_GUIS")
+		MapVoteEvent:FireClient(self.Player2, "HIDE_GUIS")
+
+		for _, player in ipairs({self.Player1, self.Player2}) do
+			if player and player.Parent then
+				task.spawn(function()
+					local playerGui = player:WaitForChild("PlayerGui")
+					local jumpGui = playerGui:FindFirstChild("JumpBasesGUI")
+					local bridgeGui = playerGui:FindFirstChild("BridgeGUI")
+					local castleGui = playerGui:FindFirstChild("CastleGUI")
+
+					if jumpGui then jumpGui.Enabled = false end
+					if bridgeGui then bridgeGui.Enabled = false end
+					if castleGui then castleGui.Enabled = false end
+				end)
+			end
+		end
+	end
+
+	self:determineMapFromVotes()
+	print("🗺️ Match " .. self.MatchId .. " - Map selected: " .. self.CurrentMap)
+
+	task.wait(1)
+
+	self:createMapInstance()
+
+	print("🎨 Match " .. self.MatchId .. " - Giving GUIs to players...")
+	task.wait(0.5)
+
+	self:giveGuiToPlayer(self.Player1)
+	self:giveGuiToPlayer(self.Player2)
+
+	task.wait(0.5)
+
+	self:startRound()
+end
+
+function Match:determineMapFromVotes()
+	local votes = {
+		JumpBases = 0,
+		Bridge = 0,
+		Castle = 0
+	}
+
+	for player, mapName in pairs(self.PlayerVotes) do
+		if votes[mapName] then
+			votes[mapName] = votes[mapName] + 1
+		end
+	end
+
+	local maxVotes = 0
+	local winningMaps = {}
+
+	for mapName, voteCount in pairs(votes) do
+		if voteCount > maxVotes then
+			maxVotes = voteCount
+			winningMaps = {mapName}
+		elseif voteCount == maxVotes and voteCount > 0 then
+			table.insert(winningMaps, mapName)
+		end
+	end
+
+	if #winningMaps == 0 then
+		winningMaps = {"JumpBases", "Bridge", "Castle"}
+	end
+
+	self.CurrentMap = winningMaps[math.random(1, #winningMaps)]
+end
+
+function Match:createMapInstance()
+	local mapTemplatesFolder = ServerStorage:FindFirstChild("MapTemplates")
+	if not mapTemplatesFolder then
+		warn("❌ MapTemplates folder not found!")
+		return nil
+	end
+
+	local templateName = self.CurrentMap .. "_Template"
+	local template = mapTemplatesFolder:FindFirstChild(templateName)
+
+	if not template then
+		template = mapTemplatesFolder:FindFirstChild(self.CurrentMap) or
+			mapTemplatesFolder:FindFirstChild("Bridge_Template") or 
+			mapTemplatesFolder:FindFirstChild("Castle_Template") or 
+			mapTemplatesFolder:FindFirstChild("JumpBases_Template")
+	end
+
+	if not template then
+		warn("❌ No map templates found!")
+		return nil
+	end
+
+	local offset, instanceNumber = MapOffsetManager.getNextOffset(self.CurrentMap)
+	self.MapInstanceNumber = instanceNumber
+
+	self.MapInstance = template:Clone()
+	self.MapInstance.Name = "Match_" .. self.MatchId .. "_" .. self.CurrentMap .. "_Instance" .. instanceNumber
+
+	local activeMatchesFolder = Workspace:FindFirstChild("ActiveMatches")
+	if not activeMatchesFolder then
+		activeMatchesFolder = Instance.new("Folder")
+		activeMatchesFolder.Name = "ActiveMatches"
+		activeMatchesFolder.Parent = Workspace
+	end
+
+	self.MapInstance.Parent = activeMatchesFolder
+
+	print("🔧 Applying offset: " .. tostring(offset))
+	for _, descendant in pairs(self.MapInstance:GetDescendants()) do
+		if descendant:IsA("BasePart") then
+			descendant.CFrame = descendant.CFrame + offset
+		end
+	end
+
+	for _, child in pairs(self.MapInstance:GetDescendants()) do
+		if child.Name == "Spawn1" or child.Name == "Spawn 1" then
+			self.Spawn1 = child
+		elseif child.Name == "Spawn2" or child.Name == "Spawn 2" then
+			self.Spawn2 = child
+		elseif child.Name == "TPPart" or child.Name:find("TP") then
+			self.TPPart = child
+		elseif child.Name == "Room" then
+			self.RoomPart = child
+		elseif child.Name == "RS" and child:IsA("BasePart") then
+			table.insert(self.RSParts, child)
+			child.Transparency = 1
+			child.CanCollide = false
+			child.Anchored = true
+		end
+	end
+
+	print("✅ Match " .. self.MatchId .. " - Map created: " .. self.CurrentMap .. " (Instance #" .. instanceNumber .. ")")
+	print("   Offset: " .. tostring(offset))
+	print("   🛡️ Found " .. #self.RSParts .. " RS barrier parts")
+
+	if self.Spawn1 then
+		print("   Spawn1 at: " .. tostring(self.Spawn1.Position))
+	end
+	if self.Spawn2 then
+		print("   Spawn2 at: " .. tostring(self.Spawn2.Position))
+	end
+
+	return self.MapInstance
+end
+
+function Match:startRound()
+	if not self.IsActive then return end
+
+	print("🔄 Match " .. self.MatchId .. " - Starting round")
+
+	if self.Spawn1 and self.Player1 and self.Player1.Parent then
+		teleportPlayerNoRespawn(self.Player1, self.Spawn1)
+	end
+	if self.Spawn2 and self.Player2 and self.Player2.Parent then
+		teleportPlayerNoRespawn(self.Player2, self.Spawn2)
+	end
+
+	if self.TPPart then
+		if self.TPConnection then
+			self.TPConnection:Disconnect()
+		end
+		self.TPConnection = self.TPPart.Touched:Connect(function(hit)
+			self:onTPTouched(hit)
+		end)
+	end
+
+	self:updateBattleGui()
+
+	self:setRSBarriers(true)
+
+	setPlayerSpeedZero(self.Player1, 3)
+	setPlayerSpeedZero(self.Player2, 3)
+
+	for i = 3, 1, -1 do
+		if not self.IsActive then break end
+		task.wait(1)
+	end
+
+	if not self.IsActive then return end
+
+	self:setRSBarriers(false)
+
+	giveBothTools(self.Player1)
+	giveBothTools(self.Player2)
+
+	self.RoundActive = true
+	print("⚔️ Match " .. self.MatchId .. " - Round active!")
+end
+
+function Match:onTPTouched(hit)
+	if not self.IsActive or not self.RoundActive then return end
+
+	local character = hit.Parent
+	if not character then return end
+
+	local player = Players:GetPlayerFromCharacter(character)
+	if not player then return end
+
+	if player ~= self.Player1 and player ~= self.Player2 then return end
+
+	self.RoundActive = false
+
+	local loser = player
+	local winner = (player == self.Player1) and self.Player2 or self.Player1
+
+	if self.RoomPart then
+		teleportPlayerNoRespawn(loser, self.RoomPart)
+	end
+
+	if winner == self.Player1 then
+		self.Score1 = self.Score1 + 1
+	else
+		self.Score2 = self.Score2 + 1
+	end
+
+	print("🎯 Match " .. self.MatchId .. " - Score: " .. self.Score1 .. "-" .. self.Score2)
+
+	self:updateBattleGui()
+
+	if RoundPlayedSignal then
+		task.spawn(function()
+			RoundPlayedSignal:Fire(self.Player1)
+		end)
+		task.spawn(function()
+			RoundPlayedSignal:Fire(self.Player2)
+		end)
+	end
+
+	if self.Score1 >= 5 or self.Score2 >= 5 then
+		print("🏆 Match " .. self.MatchId .. " - GAME OVER!")
+		self:endMatch(winner)
+	else
+		task.wait(3)
+
+		if self.Player1 and self.Player1.Parent then
+			teleportPlayerNoRespawn(self.Player1, self.Spawn1)
+		end
+		if self.Player2 and self.Player2.Parent then
+			teleportPlayerNoRespawn(self.Player2, self.Spawn2)
+		end
+
+		task.wait(0.5)
+		self:startRound()
+	end
+end
+
+function Match:endMatch(winner)
+	if not self.IsActive then return end
+
+	local loser = (winner == self.Player1) and self.Player2 or self.Player1
+
+	print("==========================================================")
+	print("🏆 MATCH " .. self.MatchId .. " ENDED")
+	print("   Winner: " .. winner.Name)
+	print("   Final: " .. self.Score1 .. " - " .. self.Score2)
+	print("   Map: " .. self.CurrentMap .. " (Instance #" .. self.MapInstanceNumber .. ")")
+	print("==========================================================")
+
+	if not self.CoinsAwarded then
+		self.CoinsAwarded = true
+
+		local winnerCoins = getMultipliedCoins(winner, 150)
+		addCoins(winner, winnerCoins)
+		print("💰 Winner " .. winner.Name .. " earned: " .. winnerCoins .. " coins")
+
+		local loserCoins = getMultipliedCoins(loser, 50)
+		addCoins(loser, loserCoins)
+		print("💰 Loser " .. loser.Name .. " earned: " .. loserCoins .. " coins")
+	end
+
+	if not self.WinPointAwarded then
+		self.WinPointAwarded = true
+
+		addWin(winner)
+
+		if WinSignal and WinSignal:IsA("BindableEvent") then
+			task.spawn(function()
+				WinSignal:Fire(winner)
+				print("✅ WinSignal FIRED for " .. winner.Name)
+			end)
+		end
+
+		incrementWinStreak(winner)
+		resetWinStreak(loser)
+	end
+
+	self:hideBattleGui()
+
+	task.wait(1)
+
+	local lobbySpawn = Workspace:WaitForChild("LobbySpawn")
+	if lobbySpawn then
+		if self.Player1 and self.Player1.Parent then
+			if self.Player1:FindFirstChild("InDuel") then
+				self.Player1.InDuel:Destroy()
+			end
+			forceRespawnAndTeleport(self.Player1, lobbySpawn)
+		end
+		if self.Player2 and self.Player2.Parent then
+			if self.Player2:FindFirstChild("InDuel") then
+				self.Player2.InDuel:Destroy()
+			end
+			forceRespawnAndTeleport(self.Player2, lobbySpawn)
+		end
+	end
+
+	task.wait(2)
+	self:cleanup()
+end
+
+function Match:handlePlayerLeft(player)
+	if not self.IsActive then return end
+
+	print("⚠️ Player left: " .. player.Name)
+
+	local otherPlayer = (player == self.Player1) and self.Player2 or self.Player1
+
+	resetWinStreak(player)
+	self:hideBattleGui()
+
+	if otherPlayer and otherPlayer.Parent then
+		local lobbySpawn = Workspace:WaitForChild("LobbySpawn")
+		if lobbySpawn then
+			if otherPlayer:FindFirstChild("InDuel") then
+				otherPlayer.InDuel:Destroy()
+			end
+			forceRespawnAndTeleport(otherPlayer, lobbySpawn)
+		end
+	end
+
+	self:cleanup()
+end
+
+-- =======================
+-- MATCH MANAGER
+-- =======================
+local MatchManager = {}
+MatchManager.ActiveMatches = {}
+MatchManager.NextMatchId = 1
+MatchManager.PadOccupancies = {
+	Pad1 = nil,
+	Pad2 = nil,
+	Pad3 = nil,
+	Pad4 = nil
+}
+
+function MatchManager.createMatch(padSet, player1, player2)
+	local matchId = MatchManager.NextMatchId
+	MatchManager.NextMatchId = MatchManager.NextMatchId + 1
+
+	local match = Match.new(matchId, padSet, player1, player2)
+	MatchManager.ActiveMatches[matchId] = match
+
+	match.PlayerConnections["p1_left"] = player1.AncestryChanged:Connect(function()
+		if not player1.Parent then
+			match:handlePlayerLeft(player1)
+			MatchManager.ActiveMatches[matchId] = nil
+		end
+	end)
+
+	match.PlayerConnections["p2_left"] = player2.AncestryChanged:Connect(function()
+		if not player2.Parent then
+			match:handlePlayerLeft(player2)
+			MatchManager.ActiveMatches[matchId] = nil
+		end
+	end)
+
+	if padSet == "Pads12" then
+		MatchManager.releasePad("Pad1")
+		MatchManager.releasePad("Pad2")
+	else
+		MatchManager.releasePad("Pad3")
+		MatchManager.releasePad("Pad4")
+	end
+
+	task.spawn(function()
+		task.wait(0.5)
+		match:startVoting()
+	end)
+
+	return match
+end
+
+function MatchManager.isPadAvailable(padName)
+	return MatchManager.PadOccupancies[padName] == nil
+end
+
+function MatchManager.occupyPad(padName, player)
+	MatchManager.PadOccupancies[padName] = player
+end
+
+function MatchManager.releasePad(padName)
+	MatchManager.PadOccupancies[padName] = nil
+end
+
+function MatchManager.getPlayerOnPad(padName)
+	return MatchManager.PadOccupancies[padName]
+end
+
+function MatchManager.getMatchForPlayer(player)
+	for matchId, match in pairs(MatchManager.ActiveMatches) do
+		if match.IsActive and (match.Player1 == player or match.Player2 == player) then
+			return match
+		end
+	end
+	return nil
+end
+
+-- =======================
+-- SKIN SYSTEM
+-- =======================
+local SkinDatabase = require(script.Parent:WaitForChild("SkinDatabase"))
+
+function loadPlayerInventory(player)
+	local userId = tostring(player.UserId)
+	if PlayerInventories[userId] then
+		return PlayerInventories[userId]
+	end
+	local success, inventory = pcall(function()
+		return InventoryDataStore:GetAsync(userId)
+	end)
+	if success and inventory then
+		if not inventory.skins or type(inventory.skins) ~= "table" then
+			inventory.skins = {}
+		end
+		if not inventory.bombs or type(inventory.bombs) ~= "table" then
+			inventory.bombs = {}
+		end
+
+		local defaultSlap = SkinDatabase:GetDefaultSkin("Slap")
+		local defaultBomb = SkinDatabase:GetDefaultSkin("Bomb")
+
+		if not inventory.skins[defaultSlap.Name] then
+			inventory.skins[defaultSlap.Name] = 1
+		end
+		if not inventory.bombs[defaultBomb.Name] then
+			inventory.bombs[defaultBomb.Name] = 1
+		end
+
+		if not inventory.equippedSlap then
+			inventory.equippedSlap = defaultSlap.Name
+		end
+		if not inventory.equippedBomb then
+			inventory.equippedBomb = defaultBomb.Name
+		end
+
+		PlayerInventories[userId] = inventory
+		return inventory
+	else
+		local defaultSlap = SkinDatabase:GetDefaultSkin("Slap")
+		local defaultBomb = SkinDatabase:GetDefaultSkin("Bomb")
+
+		PlayerInventories[userId] = {
+			skins = {[defaultSlap.Name] = 1},
+			bombs = {[defaultBomb.Name] = 1},
+			equippedSlap = defaultSlap.Name,
+			equippedBomb = defaultBomb.Name
+		}
+		return PlayerInventories[userId]
+	end
+end
+
+-- =======================
+-- COIN SYSTEM
+-- =======================
+function getCoins(player)
+	if not player then return 0 end
+	local userId = tostring(player.UserId)
+	if PlayerCoins[userId] then
+		return PlayerCoins[userId]
+	end
+	local success, coins = pcall(function()
+		return CoinDataStore:GetAsync(userId) or 0
+	end)
+	if success then
+		PlayerCoins[userId] = coins
+		return coins
+	end
+	return 0
+end
+
+function setCoins(player, amount)
+	if not player then return end
+	local userId = tostring(player.UserId)
+	PlayerCoins[userId] = math.max(0, amount)
+	task.spawn(function()
+		pcall(function()
+			CoinDataStore:SetAsync(userId, PlayerCoins[userId])
+		end)
+	end)
+	updateCoinDisplay(player)
+end
+
+function addCoins(player, amount)
+	if not player then return end
+	local current = getCoins(player)
+	setCoins(player, current + amount)
+end
+
+function updateCoinDisplay(player)
+	if not player or not player.Parent then return end
+	local coinAmount = getCoins(player)
+	local UpdateCoinDisplay = ReplicatedStorage:FindFirstChild("UpdateCoinDisplay")
+	if UpdateCoinDisplay then
+		UpdateCoinDisplay:FireClient(player, coinAmount)
+	end
+end
+
+-- =======================
+-- WINS SYSTEM
+-- =======================
+function loadWins(player)
+	if not player then return 0 end
+	local userId = tostring(player.UserId)
+
+	if PlayerWins[userId] then
+		return PlayerWins[userId]
+	end
+
+	local success, wins = pcall(function()
+		return WinsDataStore:GetAsync(userId) or 0
+	end)
+
+	if success then
+		PlayerWins[userId] = wins
+		return wins
+	end
+	return 0
+end
+
+function saveWins(player, wins)
+	if not player then return end
+	local userId = tostring(player.UserId)
+
+	pcall(function()
+		WinsDataStore:SetAsync(userId, wins)
+	end)
+end
+
+function addWin(player)
+	if not player then return 0 end
+	local userId = tostring(player.UserId)
+
+	local currentWins = loadWins(player)
+	local newWins = currentWins + 1
+	PlayerWins[userId] = newWins
+
+	saveWins(player, newWins)
+
+	local leaderstats = player:FindFirstChild("leaderstats")
+	if leaderstats then
+		local winsValue = leaderstats:FindFirstChild("Wins")
+		if winsValue then
+			winsValue.Value = newWins
+		end
+	end
+
+	return newWins
+end
+
+-- =======================
+-- WIN STREAK SYSTEM
+-- =======================
+function loadWinStreak(player)
+	if not player then return 0 end
+	local userId = tostring(player.UserId)
+	if WinStreaks[userId] then
+		return WinStreaks[userId]
+	end
+	local success, streak = pcall(function()
+		return WinStreakDataStore:GetAsync(userId) or 0
+	end)
+	if success then
+		WinStreaks[userId] = streak
+		return streak
+	end
+	return 0
+end
+
+function saveWinStreak(player, streak)
+	if not player then return end
+	local userId = tostring(player.UserId)
+	pcall(function()
+		WinStreakDataStore:SetAsync(userId, streak)
+	end)
+end
+
+function incrementWinStreak(player)
+	if not player then return 0 end
+	local userId = tostring(player.UserId)
+	local current = loadWinStreak(player)
+	WinStreaks[userId] = current + 1
+	saveWinStreak(player, WinStreaks[userId])
+	updateStreakDisplay(player)
+	return WinStreaks[userId]
+end
+
+function resetWinStreak(player)
+	if not player then return end
+	local userId = tostring(player.UserId)
+	WinStreaks[userId] = 0
+	saveWinStreak(player, 0)
+	updateStreakDisplay(player)
+end
+
+function updateStreakDisplay(player)
+	if not player or not player.Parent or not player.Character then return end
+
+	local humanoidRootPart = player.Character:FindFirstChild("HumanoidRootPart")
+	if not humanoidRootPart then return end
+
+	local existing = humanoidRootPart:FindFirstChild("StreakDisplay")
+	if existing then
+		existing:Destroy()
+	end
+
+	local streak = loadWinStreak(player)
+	if streak <= 0 then return end
+
+	local billboardGui = Instance.new("BillboardGui")
+	billboardGui.Name = "StreakDisplay"
+	billboardGui.Size = UDim2.new(0, 80, 0, 40)
+	billboardGui.StudsOffset = Vector3.new(0, 5, 0)
+	billboardGui.AlwaysOnTop = true
+	billboardGui.MaxDistance = 25
+
+	local textLabel = Instance.new("TextLabel")
+	textLabel.Size = UDim2.new(1, 0, 1, 0)
+	textLabel.BackgroundTransparency = 1
+	textLabel.Text = "🔥" .. tostring(streak)
+	textLabel.TextScaled = true
+	textLabel.Font = Enum.Font.GothamBold
+	textLabel.TextStrokeTransparency = 0
+
+	if streak >= 5 then
+		textLabel.TextColor3 = Color3.fromRGB(255, 215, 0)
+	elseif streak >= 3 then
+		textLabel.TextColor3 = Color3.fromRGB(255, 50, 50)
+	else
+		textLabel.TextColor3 = Color3.fromRGB(255, 100, 0)
+	end
+
+	textLabel.Parent = billboardGui
+	billboardGui.Parent = humanoidRootPart
+end
+
+-- =======================
+-- REMOTE EVENTS
+-- =======================
+local MapVoteEvent = ReplicatedStorage:WaitForChild("MapVoteEvent")
+local SpectateControl = ReplicatedStorage:WaitForChild("SpectateControl")
+
+local UpdateCoinDisplay = ReplicatedStorage:FindFirstChild("UpdateCoinDisplay")
+if not UpdateCoinDisplay then
+	UpdateCoinDisplay = Instance.new("RemoteEvent")
+	UpdateCoinDisplay.Name = "UpdateCoinDisplay"
+	UpdateCoinDisplay.Parent = ReplicatedStorage
+end
+
+-- =======================
+-- GAME OBJECTS
+-- =======================
+local pad1 = workspace:WaitForChild("Player 1 1v1")
+local pad2 = workspace:WaitForChild("Player 2 1v1")
+local pad3 = workspace:WaitForChild("Player 3 1v1")
+local pad4 = workspace:WaitForChild("Player 4 1v1")
+
+local screenPart1 = workspace:WaitForChild("1v1 Screen 1")
+local gui1 = screenPart1:WaitForChild("SurfaceGui")
+
+local ui1 = {
+	status = gui1:WaitForChild("StatusText"),
+	name = gui1:WaitForChild("PlayerName"),
+	img = gui1:WaitForChild("AvatarImage")
+}
+local ui2 = {
+	status = gui1:WaitForChild("StatusText 2"),
+	name = gui1:WaitForChild("PlayerName 2"),
+	img = gui1:WaitForChild("AvatarImage 2")
+}
+local timerLabel1 = gui1:WaitForChild("Calwdown 1")
+
+local screenPart2 = workspace:WaitForChild("1v1 Screen 2")
+local gui2 = screenPart2:WaitForChild("SurfaceGui")
+
+local ui3 = {
+	status = gui2:WaitForChild("StatusText 3"),
+	name = gui2:WaitForChild("PlayerName 3"),
+	img = gui2:WaitForChild("AvatarImage 3")
+}
+local ui4 = {
+	status = gui2:WaitForChild("StatusText 4"),
+	name = gui2:WaitForChild("PlayerName 4"),
+	img = gui2:WaitForChild("AvatarImage 4")
+}
+local timerLabel2 = gui2:WaitForChild("Calwdown 2")
+
+local lobbySpawn = workspace:WaitForChild("LobbySpawn")
+
+-- =======================
+-- HELPER FUNCTIONS
+-- =======================
+function resetPlayerState(player)
+	if not player or not player.Parent then return end
+	if player:FindFirstChild("InDuel") then
+		player.InDuel:Destroy()
+	end
+	SpectateControl:FireClient(player, "stop")
+	if player.Character then
+		local humanoid = player.Character:FindFirstChild("Humanoid")
+		if humanoid then
+			humanoid.WalkSpeed = 16
+		end
+	end
+	removeBothTools(player)
+end
+
+function teleportPlayerNoRespawn(player, destination)
+	if not player or not player.Parent then return false end
+	if not destination or not destination.Parent then return false end
+
+	local character = player.Character
+	if not character then return false end
+
+	local humanoidRootPart = character:FindFirstChild("HumanoidRootPart")
+	if humanoidRootPart then
+		humanoidRootPart.Velocity = Vector3.new(0, 0, 0)
+		humanoidRootPart.RotVelocity = Vector3.new(0, 0, 0)
+		humanoidRootPart.CFrame = destination.CFrame + Vector3.new(0, 5, 0)
+	else
+		character:SetPrimaryPartCFrame(destination.CFrame + Vector3.new(0, 5, 0))
+	end
+
+	if destination.Name:find("Spawn") and not destination.Name:find("Lobby") then
+		if not player:FindFirstChild("InDuel") then
+			local inDuelTag = Instance.new("BoolValue")
+			inDuelTag.Name = "InDuel"
+			inDuelTag.Value = true
+			inDuelTag.Parent = player
+		end
+	end
+
+	return true
+end
+
+function forceRespawnAndTeleport(player, destination)
+	if not player or not player.Parent then return false end
+
+	SpectateControl:FireClient(player, "stop")
+
+	if destination and destination:IsA("SpawnLocation") then
+		player.RespawnLocation = destination
+	end
+
+	if player:FindFirstChild("InDuel") then
+		player.InDuel:Destroy()
+	end
+
+	player:LoadCharacter()
+	task.wait(1)
+
+	local character = player.Character
+	if character then
+		local humanoidRootPart = character:FindFirstChild("HumanoidRootPart")
+		if humanoidRootPart then
+			humanoidRootPart.CFrame = destination.CFrame + Vector3.new(0, 5, 0)
+		end
+	end
+
+	return true
+end
+
+-- ===========================
+-- GIVE BOTH TOOLS (SLAP + BOMB) - WITH WATER & NATURAL BUNDLES
+-- ===========================
+function giveBothTools(player)
+	if not player or not player.Parent then return end
+	removeBothTools(player)
+	if not player:FindFirstChild("Backpack") then
+		player:WaitForChild("Backpack")
+	end
+
+	local userId = tostring(player.UserId)
+	PlayerInventories[userId] = nil
+	local inventory = loadPlayerInventory(player)
+
+	print("🔄 Reloaded " .. player.Name .. "'s inventory - Slap: " .. (inventory.equippedSlap or "none") .. ", Bomb: " .. (inventory.equippedBomb or "none"))
+
+	-- ===========================
+	-- GIVE SLAP TOOL
+	-- ===========================
+	local equippedSlapName = inventory.equippedSlap or "Slap"
+	local slapData = SkinDatabase:GetSkinByName(equippedSlapName)
+	if not slapData or slapData.Type ~= "Slap" then
+		slapData = SkinDatabase:GetDefaultSkin("Slap")
+		equippedSlapName = slapData.Name
+	end
+
+	local slapSkinsFolder = ServerStorage:FindFirstChild("Slap_Skins1")
+	local limitedFolder = ServerStorage:FindFirstChild("Limited")
+
+	local slapToolFolder = slapSkinsFolder
+	local slapToolName = slapData.ToolName
+
+	if equippedSlapName == "VIP Slap" then
+		slapToolFolder = limitedFolder
+		slapToolName = "VIP_Slap"
+	elseif equippedSlapName == "Lava Slap" then
+		slapToolFolder = limitedFolder
+		slapToolName = "Lava_Slap"
+	elseif equippedSlapName == "Water Slap" then
+		slapToolFolder = limitedFolder
+		slapToolName = "Water_Slap"
+	elseif equippedSlapName == "Thunder Slap" then
+		slapToolFolder = limitedFolder
+		slapToolName = "Electric_Slap"
+	end
+
+	if slapToolFolder then
+		local slapTool = slapToolFolder:FindFirstChild(slapToolName)
+		if slapTool then
+			local tool = slapTool:Clone()
+			tool.Parent = player.Backpack
+			print("✅ Gave " .. player.Name .. " slap tool: " .. slapToolName)
+		else
+			warn("⚠️ Slap tool not found: " .. slapToolName)
+		end
+	else
+		warn("⚠️ Slap skins folder not found!")
+	end
+
+	-- ===========================
+	-- GIVE BOMB TOOL
+	-- ===========================
+	local equippedBombName = inventory.equippedBomb or "Classic Bomb"
+	local bombData = SkinDatabase:GetSkinByName(equippedBombName)
+	if not bombData or bombData.Type ~= "Bomb" then
+		bombData = SkinDatabase:GetDefaultSkin("Bomb")
+		equippedBombName = bombData.Name
+	end
+
+	local bombSkinsFolder = ServerStorage:FindFirstChild("Bomb_Skins1")
+
+	local bombToolFolder = bombSkinsFolder
+	local bombToolName = bombData.ToolName
+
+	if equippedBombName == "VIP Bomb" then
+		bombToolFolder = limitedFolder
+		bombToolName = "VIP_Bomb"
+	elseif equippedBombName == "Lava Bomb" then
+		bombToolFolder = limitedFolder
+		bombToolName = "Lava_Bomb"
+	elseif equippedBombName == "Water_Bomb" then
+		bombToolFolder = limitedFolder
+		bombToolName = "Water_Bomb"
+	elseif equippedBombName == "Earth_Bomb" then
+		bombToolFolder = limitedFolder
+		bombToolName = "Earth_Bomb"
+	end
+
+	if bombToolFolder then
+		local bombTool = bombToolFolder:FindFirstChild(bombToolName)
+		if bombTool then
+			local tool = bombTool:Clone()
+			tool.Parent = player.Backpack
+			print("✅ Gave " .. player.Name .. " bomb tool: " .. bombToolName)
+		else
+			warn("⚠️ Bomb tool not found: " .. bombToolName)
+		end
+	else
+		warn("⚠️ Bomb skins folder not found!")
+	end
+end
+
+-- ===========================
+-- REMOVE BOTH TOOLS - WITH WATER & NATURAL BUNDLES
+-- ===========================
+function removeBothTools(player)
+	if not player then return end
+
+	if player.Backpack then
+		for _, item in ipairs(player.Backpack:GetChildren()) do
+			if item:IsA("Tool") then
+				if item.Name:find("Slap") or 
+					item.Name == "VIP_Slap" or 
+					item.Name == "Lava_Slap" or 
+					item.Name == "Water_Slap" or
+					item.Name == "Electric_Slap" then
+					item:Destroy()
+				end
+				if item.Name:find("Bomb") or 
+					item.Name == "VIP_Bomb" or 
+					item.Name == "Lava_Bomb" or 
+					item.Name == "Water_Bomb" or
+					item.Name == "Earth_Bomb" then
+					item:Destroy()
+				end
+			end
+		end
+	end
+
+	if player.Character then
+		for _, item in ipairs(player.Character:GetChildren()) do
+			if item:IsA("Tool") then
+				if item.Name:find("Slap") or 
+					item.Name == "VIP_Slap" or 
+					item.Name == "Lava_Slap" or 
+					item.Name == "Water_Slap" or
+					item.Name == "Electric_Slap" then
+					item:Destroy()
+				end
+				if item.Name:find("Bomb") or 
+					item.Name == "VIP_Bomb" or 
+					item.Name == "Lava_Bomb" or 
+					item.Name == "Water_Bomb" or
+					item.Name == "Earth_Bomb" then
+					item:Destroy()
+				end
+			end
+		end
+	end
+end
+
+function setPlayerSpeedZero(player, duration)
+	if not player or not player.Character then return end
+	local humanoid = player.Character:FindFirstChild("Humanoid")
+	if humanoid then
+		humanoid.WalkSpeed = 0
+		if duration and duration > 0 then
+			task.delay(duration, function()
+				if humanoid and humanoid.Parent then
+					humanoid.WalkSpeed = 16
+				end
+			end)
+		end
+	end
+end
+
+-- =======================
+-- PAD DETECTION
+-- =======================
+function isPlayerOnPad(player, pad)
+	if not player or not player.Character then return false end
+	local character = player.Character
+	local humanoidRootPart = character:FindFirstChild("HumanoidRootPart")
+	if not humanoidRootPart then return false end
+	local playerPos = humanoidRootPart.Position
+	local padPos = pad.Position
+	local padSize = pad.Size
+	local minX = padPos.X - padSize.X/2
+	local maxX = padPos.X + padSize.X/2
+	local minZ = padPos.Z - padSize.Z/2
+	local maxZ = padPos.Z + padSize.Z/2
+	return playerPos.X >= minX and playerPos.X <= maxX and
+		playerPos.Z >= minZ and playerPos.Z <= maxZ
+end
+
+function updatePadOccupants()
+	for _, player in pairs(Players:GetPlayers()) do
+		if MatchManager.getMatchForPlayer(player) then
+			continue
+		end
+
+		local pads = {
+			{pad = pad1, name = "Pad1", ui = ui1, screen = 1},
+			{pad = pad2, name = "Pad2", ui = ui2, screen = 1},
+			{pad = pad3, name = "Pad3", ui = ui3, screen = 2},
+			{pad = pad4, name = "Pad4", ui = ui4, screen = 2}
+		}
+
+		for _, padInfo in ipairs(pads) do
+			if isPlayerOnPad(player, padInfo.pad) then
+				local currentOccupant = MatchManager.getPlayerOnPad(padInfo.name)
+				if not currentOccupant then
+					MatchManager.occupyPad(padInfo.name, player)
+					updateSide(player, padInfo.ui, padInfo.screen)
+				end
+			else
+				local currentOccupant = MatchManager.getPlayerOnPad(padInfo.name)
+				if currentOccupant == player then
+					MatchManager.releasePad(padInfo.name)
+					updateSide(nil, padInfo.ui, padInfo.screen)
+				end
+			end
+		end
+	end
+end
+
+function updateSide(player, uiElements, screenNum)
+	if player and player.Parent then
+		uiElements.status.Text = "READY"
+		uiElements.status.TextColor3 = Color3.fromRGB(0, 255, 0)
+		uiElements.name.Text = player.Name
+		uiElements.name.Visible = true
+		uiElements.img.Visible = true
+		local userId = player.UserId
+		uiElements.img.Image = "https://www.roblox.com/headshot-thumbnail/image?userId=" .. userId .. "&width=100&height=100&format=png"
+	else
+		uiElements.status.Text = "WAITING"
+		uiElements.status.TextColor3 = Color3.fromRGB(255, 255, 255)
+		uiElements.name.Visible = false
+		uiElements.img.Visible = false
+	end
+end
+
+-- =======================
+-- COUNTDOWN SYSTEM
+-- =======================
+local padCountdowns = {
+	Pad1 = false,
+	Pad2 = false,
+	Pad3 = false,
+	Pad4 = false
+}
+
+function startCountdown(padSet)
+	local pad1Name, pad2Name, timerLabel
+
+	if padSet == "Pads12" then
+		pad1Name = "Pad1"
+		pad2Name = "Pad2"
+		timerLabel = timerLabel1
+	elseif padSet == "Pads34" then
+		pad1Name = "Pad3"
+		pad2Name = "Pad4"
+		timerLabel = timerLabel2
+	else
+		return
+	end
+
+	local player1 = MatchManager.getPlayerOnPad(pad1Name)
+	local player2 = MatchManager.getPlayerOnPad(pad2Name)
+
+	if not player1 or not player2 then return end
+
+	timerLabel.Text = "5"
+	timerLabel.TextColor3 = Color3.fromRGB(255, 255, 0)
+
+	for i = 5, 1, -1 do
+		local currentPlayer1 = MatchManager.getPlayerOnPad(pad1Name)
+		local currentPlayer2 = MatchManager.getPlayerOnPad(pad2Name)
+
+		if currentPlayer1 ~= player1 or currentPlayer2 ~= player2 then
+			timerLabel.Text = "WAITING"
+			timerLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+			return
+		end
+
+		timerLabel.Text = tostring(i)
+		task.wait(1)
+	end
+
+	timerLabel.Text = "MATCH START!"
+	timerLabel.TextColor3 = Color3.fromRGB(0, 255, 0)
+
+	MatchManager.createMatch(padSet, player1, player2)
+
+	if padSet == "Pads12" then
+		updateSide(nil, ui1, 1)
+		updateSide(nil, ui2, 1)
+	else
+		updateSide(nil, ui3, 2)
+		updateSide(nil, ui4, 2)
+	end
+
+	task.wait(2)
+	timerLabel.Text = "WAITING"
+	timerLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+end
+
+-- =======================
+-- MAIN GAME LOOP
+-- =======================
+task.spawn(function()
+	while true do
+		updatePadOccupants()
+
+		local padPairs = {
+			{pad1 = "Pad1", pad2 = "Pad2", set = "Pads12", label = timerLabel1},
+			{pad1 = "Pad3", pad2 = "Pad4", set = "Pads34", label = timerLabel2}
+		}
+
+		for _, pair in ipairs(padPairs) do
+			local player1 = MatchManager.getPlayerOnPad(pair.pad1)
+			local player2 = MatchManager.getPlayerOnPad(pair.pad2)
+
+			if player1 and player2 then
+				if not padCountdowns[pair.pad1] then
+					padCountdowns[pair.pad1] = true
+					padCountdowns[pair.pad2] = true
+
+					task.spawn(function()
+						startCountdown(pair.set)
+						padCountdowns[pair.pad1] = false
+						padCountdowns[pair.pad2] = false
+					end)
+				end
+			else
+				if not player1 and not player2 and pair.label.Text ~= "WAITING" then
+					pair.label.Text = "WAITING"
+					pair.label.TextColor3 = Color3.fromRGB(255, 255, 255)
+				end
+			end
+		end
+
+		task.wait(0.5)
+	end
+end)
+
+-- =======================
+-- LEADERSTATS SETUP
+-- =======================
+function setupLeaderstats(player)
+	local leaderstats = player:FindFirstChild("leaderstats")
+	if not leaderstats then
+		leaderstats = Instance.new("Folder")
+		leaderstats.Name = "leaderstats"
+		leaderstats.Parent = player
+	end
+
+	local winsValue = leaderstats:FindFirstChild("Wins")
+	if not winsValue then
+		winsValue = Instance.new("IntValue")
+		winsValue.Name = "Wins"
+		winsValue.Parent = leaderstats
+	end
+
+	local wins = loadWins(player)
+	winsValue.Value = wins
+end
+
+-- =======================
+-- PLAYER EVENTS
+-- =======================
+Players.PlayerAdded:Connect(function(player)
+	setupLeaderstats(player)
+	resetPlayerState(player)
+	getCoins(player)
+	updateCoinDisplay(player)
+	loadPlayerInventory(player)
+	loadWinStreak(player)
+
+	player.CharacterAdded:Connect(function()
+		task.wait(1)
+		updateStreakDisplay(player)
+	end)
+
+	if player.Character then
+		task.wait(1)
+		updateStreakDisplay(player)
+	end
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	local userId = tostring(player.UserId)
+
+	if PlayerWins[userId] then
+		saveWins(player, PlayerWins[userId])
+		PlayerWins[userId] = nil
+	end
+
+	if PlayerCoins[userId] then
+		pcall(function()
+			CoinDataStore:SetAsync(userId, PlayerCoins[userId])
+		end)
+		PlayerCoins[userId] = nil
+	end
+
+	if WinStreaks[userId] then
+		saveWinStreak(player, WinStreaks[userId])
+		WinStreaks[userId] = nil
+	end
+
+	PlayerInventories[userId] = nil
+
+	local pads = {"Pad1", "Pad2", "Pad3", "Pad4"}
+	for _, padName in ipairs(pads) do
+		if MatchManager.getPlayerOnPad(padName) == player then
+			MatchManager.releasePad(padName)
+		end
+	end
+
+	resetPlayerState(player)
+end)
+
+-- =======================
+-- VOTING EVENT
+-- =======================
+MapVoteEvent.OnServerEvent:Connect(function(player, mapName)
+	local match = MatchManager.getMatchForPlayer(player)
+
+	if match and match.IsActive and match.VotingActive then
+		match.PlayerVotes[player] = mapName
+
+		local votes = {
+			JumpBases = 0,
+			Bridge = 0,
+			Castle = 0
+		}
+
+		for p, m in pairs(match.PlayerVotes) do
+			if votes[m] then
+				votes[m] = votes[m] + 1
+			end
+		end
+
+		MapVoteEvent:FireClient(match.Player1, "UPDATE_VOTES", votes.JumpBases, votes.Bridge, votes.Castle)
+		MapVoteEvent:FireClient(match.Player2, "UPDATE_VOTES", votes.JumpBases, votes.Bridge, votes.Castle)
+	end
+end)
+
+-- =======================
+-- AUTO-SAVE
+-- =======================
+task.spawn(function()
+	while true do
+		task.wait(300)
+
+		for userId, wins in pairs(PlayerWins) do
+			local player = Players:GetPlayerByUserId(tonumber(userId))
+			if player then
+				saveWins(player, wins)
+			end
+		end
+
+		for userId, coins in pairs(PlayerCoins) do
+			pcall(function()
+				CoinDataStore:SetAsync(userId, coins)
+			end)
+		end
+
+		for userId, streak in pairs(WinStreaks) do
+			local player = Players:GetPlayerByUserId(tonumber(userId))
+			if player then
+				saveWinStreak(player, streak)
+			end
+		end
+	end
+end)
+
+-- =======================
+-- INITIALIZATION
+-- =======================
+print("=========================================")
+print("✅ DUEL SYSTEM READY")
+print("✅ GUI system ready")
+print("✅ IntValues system ready")
+print("✅ Map spacing system ready (250 studs)")
+print("✅ Bomb support enabled")
+print("✅ Tools refresh every round")
+print("🛡️ RS Barrier anti-exploit system ready")
+print("💰 Double Coins Gamepass ready (ID: " .. DOUBLE_COINS_GAMEPASS_ID .. ")")
+print("🌊 Water bundle support enabled")
+print("⚡ Natural bundle support enabled")
+print("=========================================")
+
+for _, player in pairs(Players:GetPlayers()) do
+	setupLeaderstats(player)
+	resetPlayerState(player)
+	getCoins(player)
+	updateCoinDisplay(player)
+	loadPlayerInventory(player)
+	loadWinStreak(player)
+
+	if player.Character then
+		task.wait(1)
+		updateStreakDisplay(player)
+	end
+end
+
+timerLabel1.Text = "WAITING"
+timerLabel1.TextColor3 = Color3.fromRGB(255, 255, 255)
+timerLabel2.Text = "WAITING"
+timerLabel2.TextColor3 = Color3.fromRGB(255, 255, 255)
+
+if not Workspace:FindFirstChild("ActiveMatches") then
+	local folder = Instance.new("Folder")
+	folder.Name = "ActiveMatches"
+	folder.Parent = Workspace
+end
+
+_G.getCoins = getCoins
+_G.addCoins = addCoins
+_G.setCoins = setCoins
+
+print("✅ System ready!")
